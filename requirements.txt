@@ -1,0 +1,17 @@
+streamlit>=1.20
+# Document parsing
+docling>=0.1.0   # if you intend to use Docling; optional fallback to pdfplumber
+pdfplumber>=0.8.0
+
+# Chunking
+chonkie>=0.1.0   # optional; app falls back to simple chunker if not installed
+
+# Embeddings (local)
+sentence-transformers>=2.2.2
+torch>=1.13.0
+
+# Qdrant
+qdrant-client>=1.5.0
+
+# Utilities
+typing-extensions
