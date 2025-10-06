@@ -1,7 +1,9 @@
 # app.py
 import os
 import tempfile
+import uuid
 from typing import List, Dict, Any
+import json
 
 import streamlit as st
 
@@ -41,6 +43,143 @@ except Exception:
 # Basic config
 st.set_page_config(page_title="Doc QA (Docling + Chonkie + Qdrant)", layout="wide")
 
+# Inject custom CSS (fonts, background, cards)
+def inject_custom_css():
+    css = """
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Merriweather:wght@300;400;700&display=swap');
+
+    :root{
+      --bg: #f3f3f3;
+      --panel: #ffffff;
+      --muted: #6b6b6b;
+      --accent: #ff9900; /* Amazon-like orange */
+      --accent-dark: #e58900;
+      --border: #e6e6e6;
+      --card-shadow: 0 4px 10px rgba(0,0,0,0.06);
+      --text: #111827;
+    }
+
+    body, .stApp {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
+    }
+
+    /* Make the main block feel like a centered page on Amazon */
+    .block-container {
+      max-width: 1100px;
+      margin: 20px auto;
+      padding: 24px;
+      background: var(--panel);
+      border-radius: 6px;
+      box-shadow: var(--card-shadow);
+      border: 1px solid var(--border);
+    }
+
+    /* Header */
+    .app-header {
+      display:flex;
+      gap:16px;
+      align-items:center;
+      padding:12px 16px;
+      border-radius:6px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.4));
+      border: 1px solid var(--border);
+      margin-bottom:16px;
+    }
+    .logo {
+      width:64px;
+      height:40px;
+      border-radius:4px;
+      background: linear-gradient(90deg,var(--accent),var(--accent-dark));
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-weight:800;
+      color:#111;
+      font-size:20px;
+      letter-spacing: -0.5px;
+    }
+    .app-title {
+      font-weight:700;
+      font-size:18px;
+      color:var(--text);
+    }
+
+    /* Cards */
+    .card {
+      background: #fff;
+      padding: 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.03);
+      margin-bottom:12px;
+    }
+
+    /* Preview text uses a comfortable serif */
+    .preview {
+      font-family: 'Merriweather', Georgia, serif;
+      color: #0f172a;
+      line-height:1.5;
+      font-size:14.5px;
+      white-space:pre-wrap;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size:13px;
+      margin-top:8px;
+    }
+
+    .combined {
+      background: #fff;
+      padding:12px;
+      border-radius:6px;
+      color:var(--text);
+      border:1px solid var(--border);
+    }
+
+    /* Primary buttons — visible and Amazon-like */
+    .stButton > button, button[kind="primary"] {
+      background: var(--accent) !important;
+      color: #111 !important;
+      border: none !important;
+      padding: 8px 14px !important;
+      font-weight: 700 !important;
+      border-radius: 4px !important;
+      box-shadow: none !important;
+      opacity: 1 !important;
+    }
+    .stButton > button:hover, button[kind="primary"]:hover {
+      background: var(--accent-dark) !important;
+    }
+
+    /* Secondary appearance */
+    .stButton > .stButton>button[variant="secondary"] {
+      background: #fff !important;
+      color: var(--text) !important;
+      border: 1px solid var(--border) !important;
+    }
+
+    /* Make inputs and sidebar light and crisp */
+    .css-1lcbmhc e1fqkh3o0, .stTextInput>div>div>input {
+      background: #fff;
+    }
+    .sidebar .stBlock {
+      background: transparent;
+    }
+
+    /* Small helper styles */
+    .result-score {
+      color: var(--accent);
+      font-weight:700;
+      margin-right:8px;
+    }
+    """
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+inject_custom_css()
+
 st.title("📄 Document QA — Docling + Chonkie + Local Embeddings + Qdrant")
 st.caption("Upload a PDF, parse it, chunk it, embed locally, store in Qdrant, and ask questions.")
 
@@ -77,7 +216,7 @@ def get_qdrant_client(host: str, port: str, api_key: str = None):
         raise ImportError("qdrant-client is not installed. See requirements.txt")
     # Try different connection modes depending on whether API key provided.
     if api_key:
-        client = QdrantClient(url=f"http://{host}:{port}", api_key=api_key)
+        client = QdrantClient(url=f"https://{host}:{port}", api_key=api_key)
     else:
         # local / no auth
         client = QdrantClient(url=f"http://{host}:{port}")
@@ -166,55 +305,140 @@ def chunk_text_with_chonkie(full_text: str) -> List[Dict[str, Any]]:
 def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddings: List[List[float]], chunks: List[Dict[str, Any]], distance: str = "Cosine"):
     """
     Create collection (if not exists) and upsert vectors with metadata.
+    Raises on error so callers (Streamlit UI) can show the exception.
     """
+    if not embeddings:
+        raise ValueError("No embeddings provided to upsert.")
+
+    if rest_models is None:
+        raise RuntimeError("qdrant_client.http.models (rest_models) not available")
+
     vector_size = len(embeddings[0])
-    # Create collection if not exists
+
+    # Ensure collection exists
     try:
-        # collection schema
-        if rest_models is None:
-            raise ImportError("qdrant-client models missing")
-        client.recreate_collection(
-            collection_name=collection_name,
-            vectors_config=rest_models.VectorParams(size=vector_size, distance=rest_models.Distance.COSINE)
-        )
-    except Exception as e:
-        # If recreate_collection fails (because it exists and you don't want to recreate), try create
+        client.get_collection(collection_name=collection_name)
+    except Exception:
         try:
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=rest_models.VectorParams(size=vector_size, distance=rest_models.Distance.COSINE)
             )
-        except Exception:
-            # ignore if exists
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to create Qdrant collection '{collection_name}': {e}")
 
-    # Prepare points
+    # Prepare points with valid IDs (unsigned int or UUID string)
     points = []
     for emb, chunk in zip(embeddings, chunks):
+        raw_id = chunk.get("id") or chunk.get("meta", {}).get("chunk_index")
+        # Determine a valid Qdrant ID: prefer integer if numeric, accept UUID strings, otherwise generate UUID4
+        if raw_id is None:
+            pid = str(uuid.uuid4())
+        else:
+            pid = None
+            # try integer
+            try:
+                pid_int = int(raw_id)
+                if pid_int >= 0:
+                    pid = pid_int
+            except Exception:
+                pass
+            if pid is None:
+                # try valid UUID string
+                try:
+                    uuid.UUID(str(raw_id))
+                    pid = str(raw_id)
+                except Exception:
+                    pid = str(uuid.uuid4())
+
         points.append(
             rest_models.PointStruct(
-                id=chunk["id"],
-                vector=emb,
-                payload={"text": chunk["text"], "meta": chunk.get("meta", {})}
+                id=pid,
+                vector=list(emb),
+                payload={"text": chunk.get("text", ""), "meta": chunk.get("meta", {})}
             )
         )
-    # Upsert
-    client.upsert(collection_name=collection_name, points=points)
+
+    # Upsert and raise on failure
+    try:
+        client.upsert(collection_name=collection_name, points=points)
+    except Exception as e:
+        raise RuntimeError(f"Qdrant upsert failed: {e}")
 
 
 def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: List[float], top_k: int = 4):
-    res = client.search(
-        collection_name=collection_name,
-        query_vector=query_embedding,
-        limit=top_k,
-    )
-    # res is a list of ScoredPoint
+    """
+    Run a vector search and return normalized results:
+    [{"id": str, "score": float|None, "text": str, "meta": dict}, ...]
+    Tries several qdrant-client method names and response shapes.
+    """
+    # try common client methods with different parameter names
+    res = None
+    tried = []
+    for method in ("search", "search_points", "query_points", "query", "search_collection"):
+        if not hasattr(client, method):
+            continue
+        tried.append(method)
+        fn = getattr(client, method)
+        try:
+            # different method signatures across versions
+            try:
+                res = fn(collection_name=collection_name, query_vector=query_embedding, limit=top_k)
+            except TypeError:
+                try:
+                    res = fn(collection_name=collection_name, query=query_embedding, limit=top_k)
+                except TypeError:
+                    res = fn(collection_name=collection_name, vector=query_embedding, limit=top_k)
+            break
+        except Exception:
+            # try next
+            res = None
+
+    if res is None:
+        raise RuntimeError(f"Qdrant search failed: no compatible search method succeeded (tried: {tried})")
+
+    # Normalize items list
+    if isinstance(res, dict):
+        items = res.get("result") or res.get("points") or res.get("hits") or []
+    else:
+        items = list(res)
+
     out = []
-    for item in res:
-        payload = item.payload or {}
-        text = payload.get("text") or ""
-        meta = payload.get("meta") or {}
-        out.append({"id": item.id, "score": float(item.score), "text": text, "meta": meta})
+    for item in items:
+        # support object-with-attrs or dicts
+        if isinstance(item, dict):
+            payload = item.get("payload") or item.get("payload", {}) or item.get("payload", None)
+            score = item.get("score") or item.get("distance") or item.get("payload", {}).get("score") if isinstance(item.get("payload"), dict) else None
+            id_ = item.get("id") or item.get("point_id") or item.get("payload", {}).get("id")
+        else:
+            payload = getattr(item, "payload", None)
+            score = getattr(item, "score", None) or getattr(item, "distance", None)
+            id_ = getattr(item, "id", None) or getattr(item, "point_id", None)
+
+        # payload -> text/meta extraction (robust)
+        text = ""
+        meta = {}
+        if isinstance(payload, dict):
+            # common patterns: payload={"text": "...", "meta": {...}} or payload={"payload": {...}}
+            if "text" in payload:
+                text = payload.get("text") or ""
+            elif "payload" in payload and isinstance(payload["payload"], dict):
+                text = payload["payload"].get("text", "") or ""
+                meta = payload["payload"].get("meta", {}) or {}
+            else:
+                # fallback: try to stringify the payload
+                text = payload.get("text") or ""
+                meta = payload.get("meta") or {}
+        elif payload is not None:
+            text = str(payload)
+
+        out.append({
+            "id": str(id_) if id_ is not None else "",
+            "score": float(score) if score is not None else None,
+            "text": text or "",
+            "meta": meta or {}
+        })
+
     return out
 
 
@@ -241,11 +465,38 @@ else:
                 st.stop()
 
         st.success("PDF parsed. Chunking...")
+
         chunks = chunk_text_with_chonkie(full_text)
         st.write(f"Produced {len(chunks)} chunks (approx). Showing first 3 chunks below:")
+
+        # pretty chunk cards
+        def render_chunk_card(chunk):
+            preview = chunk.get("text", "")[:1200]
+            # Ensure meta is a dict and safely extract chunk_index
+            meta = chunk.get("meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            chunk_index = meta.get("chunk_index", "-")
+
+            # Escape HTML in preview to avoid rendering issues
+            preview_escaped = preview.replace("<", "&lt;").replace(">", "&gt;")
+
+            meta_str = json.dumps(meta, ensure_ascii=False)
+
+            html = f'''
+              <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <div style="font-weight:700">{chunk.get("id")}</div>
+                  <div style="color:var(--muted);font-size:13px">chunk #{chunk_index}</div>
+                </div>
+                <div class="preview" style="margin-top:8px">{preview_escaped}</div>
+                <div class="meta">Meta: {meta_str}</div>
+              </div>
+            '''
+            st.markdown(html, unsafe_allow_html=True)
+
         for c in chunks[:3]:
-            st.write(f"**{c['id']}** — {c['meta']}")
-            st.write(c["text"][:800] + ("..." if len(c["text"]) > 800 else ""))
+            render_chunk_card(c)
 
         # Load embedding model
         try:
@@ -312,17 +563,35 @@ else:
         if not results:
             st.warning("No results found — maybe the PDF wasn't indexed, or collection name differs.")
         else:
-            st.success(f"Found {len(results)} relevant chunks (top {TOP_K} shown).")
-            for i, r in enumerate(results):
-                st.markdown(f"**Result #{i+1} — score: {r['score']:.4f} — id: {r['id']}**")
-                st.write(r["text"])
-                st.caption(f"meta: {r.get('meta')}")
+            st.subheader("Search Results")
+            st.write(f"Top {min(len(results), TOP_K)} results from collection '{COLLECTION_NAME}':")
 
-            # Optionally: provide a combined context for external LLM (not included).
+            def render_result_card(r, idx):
+                score_str = f"{r['score']:.4f}" if r['score'] is not None else "n/a"
+                text_preview = r['text'][:2000]
+                meta_html = ""
+                if r.get("meta"):
+                    meta_html = f"<div class='meta'>Metadata: {r['meta']}</div>"
+                html = f'''
+                  <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                      <div style="font-weight:700">Result #{idx+1}</div>
+                      <div><span class="result-score">{score_str}</span><span style="color:var(--muted);font-size:13px">id: {r['id']}</span></div>
+                    </div>
+                    <div class="preview" style="margin-top:8px">{text_preview}</div>
+                    {meta_html}
+                  </div>
+                '''
+                st.markdown(html, unsafe_allow_html=True)
+
+            for i, r in enumerate(results[:TOP_K]):
+                render_result_card(r, i)
+
+            # Combined context
+            combined = "\n\n---\n\n".join([r["text"] for r in results[:TOP_K]])
             st.divider()
-            st.subheader("Combined context (concatenated top chunks)")
-            combined = "\n\n---\n\n".join([r["text"] for r in results])
-            st.write(combined[:4000] + ("..." if len(combined) > 4000 else ""))
+            st.subheader("Combined context (top results)")
+            st.markdown(f"<div class='combined'>{combined[:8000].replace('<','&lt;').replace('>','&gt;')}{'...' if len(combined)>8000 else ''}</div>", unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
 st.sidebar.write("Troubleshooting / tips:")
