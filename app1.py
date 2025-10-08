@@ -188,7 +188,15 @@ st.sidebar.header("Qdrant & settings")
 
 QDRANT_HOST = st.sidebar.text_input("Qdrant Host", value=os.getenv("QDRANT_HOST", "localhost"))
 QDRANT_PORT = st.sidebar.text_input("Qdrant Port", value=os.getenv("QDRANT_PORT", "6333"))
-QDRANT_API_KEY = st.sidebar.text_input("Qdrant API Key (if any)", value=os.getenv("QDRANT_API_KEY", ""))
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
+# st.sidebar.text_input("Qdrant API Key (if any)", value=os.getenv("QDRANT_API_KEY", ""))
+# # Do not prefill or display the API key from environment — keep the field empty and masked.
+# QDRANT_API_KEY = st.sidebar.text_input(
+#     "Qdrant API Key (optional)",
+#     value="",
+#     type="password",
+#     placeholder="Set via QDRANT_API_KEY env var or paste here (hidden)"
+# )
 COLLECTION_NAME = st.sidebar.text_input("Collection name", value=os.getenv("QDRANT_COLLECTION", "documents"))
 EMBEDDING_MODEL_NAME = st.sidebar.text_input("SentenceTransformer model", value=os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2"))
 TOP_K = st.sidebar.slider("Top K results", 1, 10, 4)
@@ -568,17 +576,30 @@ else:
 
             def render_result_card(r, idx):
                 score_str = f"{r['score']:.4f}" if r['score'] is not None else "n/a"
-                text_preview = r['text'][:2000]
+                text_preview = (r['text'] or "")[:2000]
+                # safe meta rendering
                 meta_html = ""
                 if r.get("meta"):
-                    meta_html = f"<div class='meta'>Metadata: {r['meta']}</div>"
+                    meta_html = f"<div class='meta'>Metadata: {json.dumps(r['meta'], ensure_ascii=False)}</div>"
+
+                # escape to avoid raw HTML injection
+                text_esc = text_preview.replace("<", "&lt;").replace(">", "&gt;")
+
                 html = f'''
                   <div class="card">
                     <div style="display:flex;justify-content:space-between;align-items:center">
                       <div style="font-weight:700">Result #{idx+1}</div>
                       <div><span class="result-score">{score_str}</span><span style="color:var(--muted);font-size:13px">id: {r['id']}</span></div>
                     </div>
-                    <div class="preview" style="margin-top:8px">{text_preview}</div>
+
+                    <div style="margin-top:10px">
+                      <div style="font-weight:600;margin-bottom:6px">Score:</div>
+                      <div style="color:var(--accent);margin-bottom:10px">{score_str}</div>
+
+                      <div style="font-weight:600;margin-bottom:6px">Text:</div>
+                      <div class="preview" style="margin-top:0px">{text_esc}</div>
+                    </div>
+
                     {meta_html}
                   </div>
                 '''
