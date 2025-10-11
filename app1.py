@@ -4,6 +4,7 @@ import tempfile
 import uuid
 from typing import List, Dict, Any
 import json
+import csv
 
 import streamlit as st
 
@@ -41,7 +42,7 @@ except Exception:
     pdfplumber = None
 
 # Basic config
-st.set_page_config(page_title="Doc QA (Docling + Chonkie + Qdrant)", layout="wide")
+st.set_page_config(page_title="Document Navigator", layout="wide")
 
 # Inject custom CSS (fonts, background, cards)
 def inject_custom_css():
@@ -241,6 +242,116 @@ def simple_chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> Li
         i += chunk_size - overlap
     return chunks
 
+
+def parse_text_file(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
+    """
+    Parse TXT or TSV/CSV bytes into chunks:
+    - For TSV/CSV: each row becomes one chunk with meta containing the row dict (using header if present).
+    - For TXT: split into chunks (using chonkie if available or simple chunker).
+    Returns list of {"id": str, "text": str, "meta": {...}}
+    """
+    text_chunks: List[Dict[str, Any]] = []
+    name = (filename or "").lower()
+
+    # CSV / TSV
+    if name.endswith((".tsv", ".csv")):
+        try:
+            s = file_bytes.decode("utf-8")
+        except Exception:
+            s = file_bytes.decode("latin-1", errors="ignore")
+        delim = "\t" if name.endswith(".tsv") else ","
+        lines = s.splitlines()
+        # Try DictReader first (works if header present)
+        try:
+            reader = csv.DictReader(lines, delimiter=delim)
+            for i, row in enumerate(reader):
+                # row can be OrderedDict; stringify values
+                row_text = " \n ".join([f"{k}: {v}" for k, v in row.items() if v is not None and v != ""])
+                meta = {"row_index": i, "row": row}
+                text_chunks.append({"id": f"row_{i}", "text": row_text or "", "meta": meta})
+        except Exception:
+            text_chunks = []
+
+        # If DictReader produced nothing (no header) or failed, fallback to simple reader
+        if not text_chunks:
+            try:
+                reader2 = csv.reader(lines, delimiter=delim)
+                for i, row in enumerate(reader2):
+                    row_text = " \n ".join([str(c) for c in row if c is not None and c != ""])
+                    meta = {"row_index": i}
+                    text_chunks.append({"id": f"row_{i}", "text": row_text or "", "meta": meta})
+            except Exception:
+                # last resort: entire file as one chunk
+                text_chunks = [{"id": "text_0", "text": s, "meta": {"source": filename}}]
+
+        return text_chunks
+
+    # Plain text (.txt) or fallback
+    try:
+        s = file_bytes.decode("utf-8")
+    except Exception:
+        s = file_bytes.decode("latin-1", errors="ignore")
+
+    if name.endswith(".txt") or not name:
+        # If small file, keep as single chunk
+        if len(s) < 4000:
+            return [{"id": "text_0", "text": s, "meta": {"source": filename}}]
+        # else chunk
+        chunk_texts = chunk_text_with_chonkie(s)
+        return [{"id": f"text_{i}", "text": c, "meta": {"chunk_index": i, "source": filename}} for i, c in enumerate(chunk_texts)]
+
+    # fallback: whole content
+    return [{"id": "text_0", "text": s, "meta": {"source": filename}}]
+
+
+def index_chunks_and_upsert(chunks: List[Dict[str, Any]]):
+    """
+    Given prepared chunks (id/text/meta), compute embeddings and upsert to Qdrant.
+    Uses cached model and client functions and shows Streamlit spinners/errors.
+    """
+    if not chunks:
+        st.warning("No chunks to index.")
+        return
+
+    texts = [c.get("text", "") for c in chunks]
+
+    # Load embedding model
+    try:
+        with st.spinner(f"Loading embedding model {EMBEDDING_MODEL_NAME}..."):
+            embed_model = load_embedding_model(EMBEDDING_MODEL_NAME)
+    except Exception as e:
+        st.exception(f"Error loading embedding model: {e}")
+        st.stop()
+
+    # Compute embeddings (in-memory)
+    try:
+        with st.spinner("Computing embeddings..."):
+            # sentence-transformers returns numpy array when convert_to_numpy=True
+            embeddings = embed_model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+            embeddings_list = [emb.tolist() for emb in embeddings]
+    except Exception as e:
+        st.exception(f"Embedding error: {e}")
+        st.stop()
+
+    # Connect to Qdrant
+    try:
+        with st.spinner("Connecting to Qdrant..."):
+            client = get_qdrant_client(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY or None)
+    except Exception as e:
+        st.exception(f"Error connecting to Qdrant: {e}")
+        st.stop()
+
+    # Upsert
+    try:
+        with st.spinner("Upserting vectors to Qdrant..."):
+            upsert_chunks_to_qdrant(client, COLLECTION_NAME, embeddings_list, chunks)
+    except Exception as e:
+        st.exception(f"Upsert error: {e}")
+        st.stop()
+
+    st.success(f"Indexed {len(chunks)} chunks into Qdrant collection '{COLLECTION_NAME}'.")
+# ...existing code...
+
 # Parse PDF using docling if available, else use pdfplumber
 def parse_pdf_bytes(file_bytes: bytes) -> str:
     # Prefer docling
@@ -308,6 +419,42 @@ def chunk_text_with_chonkie(full_text: str) -> List[Dict[str, Any]]:
     # fallback
     chunks = simple_chunk_text(full_text, chunk_size=500, overlap=50)
     return [{"id": f"chunk_{i}", "text": c, "meta": {"chunk_index": i}} for i, c in enumerate(chunks)]
+
+
+# Add this function so render_chunk_card is available before use
+def render_chunk_card(chunk: Dict[str, Any]):
+    """
+    Render a single chunk as a styled card in Streamlit.
+    Safely handle meta (ensure dict), escape text, and show id / chunk index.
+    """
+    # Ensure safe meta
+    meta = chunk.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {"meta": str(meta)}
+
+    chunk_index = meta.get("chunk_index", meta.get("row_index", "-"))
+    chunk_id = chunk.get("id", "-")
+    preview = (chunk.get("text", "") or "")[:1200]
+
+    # Escape HTML-sensitive chars
+    preview_escaped = preview.replace("<", "&lt;").replace(">", "&gt;")
+    # Stringify meta for display
+    try:
+        meta_str = json.dumps(meta, ensure_ascii=False)
+    except Exception:
+        meta_str = str(meta)
+
+    html = f'''
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-weight:700">{chunk_id}</div>
+          <div style="color:var(--muted);font-size:13px">chunk #{chunk_index}</div>
+        </div>
+        <div class="preview" style="margin-top:8px">{preview_escaped}</div>
+        <div class="meta">Meta: {meta_str}</div>
+      </div>
+    '''
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddings: List[List[float]], chunks: List[Dict[str, Any]], distance: str = "Cosine"):
@@ -451,7 +598,7 @@ def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: L
 
 
 # Begin UI interaction
-uploaded = st.file_uploader("Upload a PDF file", type=["pdf"])
+uploaded = st.file_uploader("Upload a file (PDF / TSV / CSV / TXT)", type=["pdf", "tsv", "csv", "txt"])
 
 if uploaded is None:
     st.info("Upload a PDF to get started. Example: academic paper, report, or contract.")
@@ -459,89 +606,51 @@ else:
     st.session_state.setdefault("last_file_name", uploaded.name)
     st.write(f"**File:** {uploaded.name} — size: {uploaded.size} bytes")
 
-    parse_button = st.button("Parse & Index PDF into Qdrant")
+    # New: detect text/tsv/csv and provide a Parse & Index action
+    parse_button = st.button("Parse & Index file into Qdrant")
+
     if parse_button:
-        with st.spinner("Parsing PDF..."):
+        filename = uploaded.name or "uploaded"
+        file_bytes = uploaded.read()
+        if filename.lower().endswith(".pdf"):
+            # existing PDF path
+            with st.spinner("Parsing PDF..."):
+                try:
+                    full_text = parse_pdf_bytes(file_bytes)
+                    if not full_text or not full_text.strip():
+                        st.error("No text could be extracted from the PDF.")
+                        raise RuntimeError("Empty extracted text")
+                except Exception as e:
+                    st.exception(f"Error parsing PDF: {e}")
+                    st.stop()
+
+            st.success("PDF parsed. Chunking...")
+            chunks = chunk_text_with_chonkie(full_text)
+            chunks = [{"id": f"chunk_{i}", "text": c, "meta": {"chunk_index": i}} for i, c in enumerate(chunks)]
+            st.write(f"Produced {len(chunks)} chunks (approx). Showing first 3 chunks below:")
+            for c in chunks[:3]:
+                render_chunk_card(c)
+
+            # index and upsert
+            index_chunks_and_upsert(chunks)
+
+        else:
+            # TSV/CSV/TXT path
             try:
-                file_bytes = uploaded.read()
-                full_text = parse_pdf_bytes(file_bytes)
-                if not full_text or not full_text.strip():
-                    st.error("No text could be extracted from the PDF.")
-                    raise RuntimeError("Empty extracted text")
+                parsed_chunks = parse_text_file(file_bytes, filename)
+                if not parsed_chunks:
+                    st.error("No usable content found in the uploaded text file.")
+                    st.stop()
             except Exception as e:
-                st.exception(f"Error parsing PDF: {e}")
+                st.exception(f"Error parsing text file: {e}")
                 st.stop()
 
-        st.success("PDF parsed. Chunking...")
+            st.success("File parsed. Showing first 3 parsed items:")
+            for c in parsed_chunks[:3]:
+                render_chunk_card(c)
 
-        chunks = chunk_text_with_chonkie(full_text)
-        st.write(f"Produced {len(chunks)} chunks (approx). Showing first 3 chunks below:")
-
-        # pretty chunk cards
-        def render_chunk_card(chunk):
-            preview = chunk.get("text", "")[:1200]
-            # Ensure meta is a dict and safely extract chunk_index
-            meta = chunk.get("meta") or {}
-            if not isinstance(meta, dict):
-                meta = {}
-            chunk_index = meta.get("chunk_index", "-")
-
-            # Escape HTML in preview to avoid rendering issues
-            preview_escaped = preview.replace("<", "&lt;").replace(">", "&gt;")
-
-            meta_str = json.dumps(meta, ensure_ascii=False)
-
-            html = f'''
-              <div class="card">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                  <div style="font-weight:700">{chunk.get("id")}</div>
-                  <div style="color:var(--muted);font-size:13px">chunk #{chunk_index}</div>
-                </div>
-                <div class="preview" style="margin-top:8px">{preview_escaped}</div>
-                <div class="meta">Meta: {meta_str}</div>
-              </div>
-            '''
-            st.markdown(html, unsafe_allow_html=True)
-
-        for c in chunks[:3]:
-            render_chunk_card(c)
-
-        # Load embedding model
-        try:
-            with st.spinner(f"Loading embedding model {EMBEDDING_MODEL_NAME}..."):
-                embed_model = load_embedding_model(EMBEDDING_MODEL_NAME)
-        except Exception as e:
-            st.exception(f"Error loading embedding model: {e}")
-            st.stop()
-
-        # Compute embeddings in batches
-        texts = [c["text"] for c in chunks]
-        try:
-            with st.spinner("Computing embeddings..."):
-                embeddings = embed_model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-                # Convert to list of floats
-                embeddings_list = [emb.tolist() for emb in embeddings]
-        except Exception as e:
-            st.exception(f"Embedding error: {e}")
-            st.stop()
-
-        # Connect to Qdrant
-        try:
-            with st.spinner("Connecting to Qdrant..."):
-                client = get_qdrant_client(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY or None)
-        except Exception as e:
-            st.exception(f"Error connecting to Qdrant: {e}")
-            st.stop()
-
-        # Upsert to Qdrant
-        try:
-            with st.spinner("Upserting vectors to Qdrant..."):
-                upsert_chunks_to_qdrant(client, COLLECTION_NAME, embeddings_list, chunks)
-        except Exception as e:
-            st.exception(f"Upsert error: {e}")
-            st.stop()
-
-        st.success(f"Indexed {len(chunks)} chunks into Qdrant collection '{COLLECTION_NAME}'.")
+            # index and upsert
+            index_chunks_and_upsert(parsed_chunks)
 
     st.divider()
     st.header("Ask questions about the document")
@@ -623,3 +732,4 @@ st.sidebar.write("""
 - If `docling` or `chonkie` are not installed/fail, the app will fall back to `pdfplumber` and a simple chunker.
 - For large PDFs, consider increasing memory and using batching for embeddings.
 """)
+
