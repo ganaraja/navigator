@@ -10,6 +10,23 @@ import re
 
 import streamlit as st
 
+# Plotting libraries
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import pandas as pd
+    import numpy as np
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    st.error("Plotting libraries not available. Install with: pip install plotly pandas numpy")
+    px = None
+    go = None
+    make_subplots = None
+    pd = None
+    np = None
+    PLOTTING_AVAILABLE = False
+
 # Try the expected libs; provide helpful messages if missing.
 try:
     import docling
@@ -553,6 +570,107 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
         st.success(f"Successfully upserted {total_points} points in {successful_batches} batches")
 
 
+def get_collection_count(client: QdrantClient, collection_name: str) -> int:
+    """
+    Get the total number of points in a collection.
+    """
+    try:
+        collection_info = client.get_collection(collection_name)
+        return collection_info.points_count
+    except Exception as e:
+        st.warning(f"Could not get collection count: {e}")
+        return 0
+
+def create_search_visualization(results: List[Dict[str, Any]], total_count: int, collection_name: str):
+    """
+    Create visualizations for search results showing distribution and percentages.
+    """
+    if not results or total_count == 0:
+        return
+    
+    # Prepare data for visualization
+    result_scores = [r.get('score', 0) for r in results]
+    result_indices = list(range(1, len(results) + 1))
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[
+            f'Search Results Distribution (Top {len(results)} of {total_count})',
+            'Similarity Scores',
+            'Coverage Percentage',
+            'Result Quality Distribution'
+        ],
+        specs=[[{"type": "bar"}, {"type": "scatter"}],
+               [{"type": "pie"}, {"type": "histogram"}]]
+    )
+    
+    # 1. Bar chart showing result distribution
+    fig.add_trace(
+        go.Bar(
+            x=result_indices,
+            y=result_scores,
+            name="Similarity Scores",
+            marker_color='lightblue',
+            text=[f"{score:.3f}" for score in result_scores],
+            textposition='auto'
+        ),
+        row=1, col=1
+    )
+    
+    # 2. Scatter plot of scores
+    fig.add_trace(
+        go.Scatter(
+            x=result_indices,
+            y=result_scores,
+            mode='markers+lines',
+            name="Score Trend",
+            marker=dict(size=10, color='red'),
+            line=dict(color='red', width=2)
+        ),
+        row=1, col=2
+    )
+    
+    # 3. Pie chart showing coverage
+    coverage_percentage = (len(results) / total_count) * 100
+    fig.add_trace(
+        go.Pie(
+            labels=['Retrieved', 'Not Retrieved'],
+            values=[len(results), total_count - len(results)],
+            name="Coverage",
+            marker_colors=['lightgreen', 'lightgray']
+        ),
+        row=2, col=1
+    )
+    
+    # 4. Histogram of score distribution
+    fig.add_trace(
+        go.Histogram(
+            x=result_scores,
+            name="Score Distribution",
+            marker_color='orange',
+            nbinsx=min(10, len(result_scores))
+        ),
+        row=2, col=2
+    )
+    
+    # Update layout
+    fig.update_layout(
+        height=800,
+        title_text=f"Search Analysis for Collection: {collection_name}",
+        showlegend=False
+    )
+    
+    # Update axes labels
+    fig.update_xaxes(title_text="Result Rank", row=1, col=1)
+    fig.update_yaxes(title_text="Similarity Score", row=1, col=1)
+    fig.update_xaxes(title_text="Result Rank", row=1, col=2)
+    fig.update_yaxes(title_text="Similarity Score", row=1, col=2)
+    fig.update_xaxes(title_text="Similarity Score", row=2, col=2)
+    fig.update_yaxes(title_text="Count", row=2, col=2)
+    
+    return fig
+
 def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: List[float], top_k: int = 4):
     """
     Search vectors in Qdrant collection using semantic similarity.
@@ -796,9 +914,38 @@ if collections:
         if not results:
             st.warning("No results found — maybe the PDF wasn't indexed, or collection name differs.")
         else:
+            # Get total count for visualization
+            total_count = get_collection_count(client, search_collection)
+            
             st.subheader("Search Results")
             st.write(f"Top {min(len(results), TOP_K)} results from collection '{search_collection}':")
+            
+            # Display statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Results Found", len(results))
+            with col2:
+                st.metric("Total Documents", total_count)
+            with col3:
+                coverage_pct = (len(results) / total_count * 100) if total_count > 0 else 0
+                st.metric("Coverage", f"{coverage_pct:.1f}%")
+            with col4:
+                avg_score = sum(r.get('score', 0) for r in results) / len(results) if results else 0
+                st.metric("Avg Score", f"{avg_score:.3f}")
+            
+            # Create and display visualization
+            if PLOTTING_AVAILABLE and total_count > 0:
+                st.subheader("📊 Search Analysis")
+                fig = create_search_visualization(results, total_count, search_collection)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Install plotly, pandas, and numpy to see search visualizations: `pip install plotly pandas numpy`")
 
+            # Individual search results
+            st.subheader("📄 Detailed Results")
+            
+            # Render individual result cards
             def render_result_card(r: Dict[str, Any], idx: int):
                 """
                 Render a search result using Streamlit native components with improved text formatting.
