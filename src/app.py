@@ -203,6 +203,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 COLLECTION_NAME = st.sidebar.text_input("Collection name", value=os.getenv("QDRANT_COLLECTION", "documents"))
 EMBEDDING_MODEL_NAME = st.sidebar.text_input("SentenceTransformer model", value=os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2"))
 TOP_K = st.sidebar.slider("Top K results", 1, 10, 4)
+BATCH_SIZE = st.sidebar.slider("Upsert batch size", 10, 1000, 100, help="Number of chunks to process in each batch. Smaller batches use less memory but take longer.")
 
 # Helper messages about login
 st.sidebar.markdown(
@@ -218,7 +219,7 @@ st.sidebar.markdown(
 def load_embedding_model(name: str):
     if SentenceTransformer is None:
         raise ImportError("sentence-transformers is not installed. See requirements.txt")
-    model = SentenceTransformer(name)
+    model = SentenceTransformer(name, device="cuda")
     return model
 
 @st.cache_resource(show_spinner=False)
@@ -348,7 +349,7 @@ def index_chunks_and_upsert(chunks: List[Dict[str, Any]], collection_name: str =
     # Upsert
     try:
         with st.spinner("Upserting vectors to Qdrant..."):
-            upsert_chunks_to_qdrant(client, collection_name, embeddings_list, chunks)
+            upsert_chunks_to_qdrant(client, collection_name, embeddings_list, chunks, batch_size=BATCH_SIZE)
     except Exception as e:
         st.exception(f"Upsert error: {e}")
         st.stop()
@@ -471,9 +472,9 @@ def render_chunk_card(chunk: Dict[str, Any]):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddings: List[List[float]], chunks: List[Dict[str, Any]], distance: str = "Cosine"):
+def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddings: List[List[float]], chunks: List[Dict[str, Any]], distance: str = "Cosine", batch_size: int = 100):
     """
-    Create collection (if not exists) and upsert vectors with metadata.
+    Create collection (if not exists) and upsert vectors with metadata in batches.
     Raises on error so callers (Streamlit UI) can show the exception.
     """
     if not embeddings:
@@ -496,8 +497,8 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
         except Exception as e:
             raise RuntimeError(f"Failed to create Qdrant collection '{collection_name}': {e}")
 
-    # Prepare points with valid IDs (unsigned int or UUID string)
-    points = []
+    # Prepare all points with valid IDs (unsigned int or UUID string)
+    all_points = []
     for emb, chunk in zip(embeddings, chunks):
         raw_id = chunk.get("id") or chunk.get("meta", {}).get("chunk_index")
         # Determine a valid Qdrant ID: prefer integer if numeric, accept UUID strings, otherwise generate UUID4
@@ -520,7 +521,7 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
                 except Exception:
                     pid = str(uuid.uuid4())
 
-        points.append(
+        all_points.append(
             rest_models.PointStruct(
                 id=pid,
                 vector=list(emb),
@@ -528,11 +529,28 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
             )
         )
 
-    # Upsert and raise on failure
+    # Upsert in batches to avoid payload size limits
+    total_points = len(all_points)
+    successful_batches = 0
+    
     try:
-        client.upsert(collection_name=collection_name, points=points)
+        for i in range(0, total_points, batch_size):
+            batch_points = all_points[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (total_points + batch_size - 1) // batch_size
+            
+            # Show progress for large uploads
+            if total_batches > 1:
+                st.write(f"Processing batch {batch_num}/{total_batches} ({len(batch_points)} points)")
+            
+            client.upsert(collection_name=collection_name, points=batch_points)
+            successful_batches += 1
+            
     except Exception as e:
-        raise RuntimeError(f"Qdrant upsert failed: {e}")
+        raise RuntimeError(f"Qdrant upsert failed at batch {successful_batches + 1}: {e}")
+    
+    if total_batches > 1:
+        st.success(f"Successfully upserted {total_points} points in {successful_batches} batches")
 
 
 def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: List[float], top_k: int = 4):
