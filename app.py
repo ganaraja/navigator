@@ -306,11 +306,13 @@ def parse_text_file(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
     return [{"id": "text_0", "text": s, "meta": {"source": filename}}]
 
 
-def index_chunks_and_upsert(chunks: List[Dict[str, Any]]):
+def index_chunks_and_upsert(chunks: List[Dict[str, Any]], collection_name: str = None):
     """
     Given prepared chunks (id/text/meta), compute embeddings and upsert to Qdrant.
     Uses cached model and client functions and shows Streamlit spinners/errors.
     """
+    if collection_name is None:
+        collection_name = COLLECTION_NAME
     if not chunks:
         st.warning("No chunks to index.")
         return
@@ -346,12 +348,15 @@ def index_chunks_and_upsert(chunks: List[Dict[str, Any]]):
     # Upsert
     try:
         with st.spinner("Upserting vectors to Qdrant..."):
-            upsert_chunks_to_qdrant(client, COLLECTION_NAME, embeddings_list, chunks)
+            upsert_chunks_to_qdrant(client, collection_name, embeddings_list, chunks)
     except Exception as e:
         st.exception(f"Upsert error: {e}")
         st.stop()
 
-    st.success(f"Indexed {len(chunks)} chunks into Qdrant collection '{COLLECTION_NAME}'.")
+    st.success(f"Indexed {len(chunks)} chunks into Qdrant collection '{collection_name}'.")
+    
+    # Track the recently uploaded collection for search defaults
+    st.session_state.recently_uploaded_collection = collection_name
 # ...existing code...
 
 # Parse PDF using docling if available, else use pdfplumber
@@ -584,6 +589,71 @@ def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: L
         raise RuntimeError(f"Qdrant search failed: {e}")
 
 
+# Collection Management Section
+st.header("📁 Collection Management")
+
+def get_all_collections():
+    """Get all collections from Qdrant"""
+    try:
+        client = get_qdrant_client(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY or None)
+        collections = client.get_collections()
+        return [collection.name for collection in collections.collections]
+    except Exception as e:
+        st.error(f"Error fetching collections: {e}")
+        return []
+
+def delete_collection(collection_name):
+    """Delete a collection from Qdrant"""
+    try:
+        client = get_qdrant_client(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY or None)
+        client.delete_collection(collection_name)
+        return True
+    except Exception as e:
+        st.error(f"Error deleting collection '{collection_name}': {e}")
+        return False
+
+# Get all collections
+collections = get_all_collections()
+
+if collections:
+    st.write(f"Found {len(collections)} collection(s):")
+    
+    # Create two columns for dropdown and delete button
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        selected_collection = st.selectbox(
+            "Select a collection to manage:",
+            collections,
+            key="collection_selector"
+        )
+    
+    with col2:
+        if st.button("🗑️ Delete Collection", key="delete_collection_btn"):
+            if selected_collection:
+                # Confirmation dialog
+                if st.session_state.get("confirm_delete", False):
+                    if delete_collection(selected_collection):
+                        st.success(f"Collection '{selected_collection}' deleted successfully!")
+                        st.session_state.confirm_delete = False
+                        # Force refresh by rerunning
+                        st.rerun()
+                    else:
+                        st.session_state.confirm_delete = False
+                else:
+                    st.session_state.confirm_delete = True
+                    st.warning(f"⚠️ Are you sure you want to delete '{selected_collection}'? Click the delete button again to confirm.")
+            else:
+                st.warning("Please select a collection to delete.")
+    
+    # Show confirmation message if needed
+    if st.session_state.get("confirm_delete", False):
+        st.info("Click the delete button again to confirm deletion.")
+    
+    st.divider()
+else:
+    st.info("No collections found. Upload and index a document to create your first collection.")
+
 # Begin UI interaction
 uploaded = st.file_uploader("Upload a file (PDF / TSV / CSV / TXT)", type=["pdf", "tsv", "csv", "txt"])
 
@@ -592,6 +662,26 @@ if uploaded is None:
 else:
     st.session_state.setdefault("last_file_name", uploaded.name)
     st.write(f"**File:** {uploaded.name} — size: {uploaded.size} bytes")
+
+    # Collection name input
+    st.subheader("Collection Settings")
+    
+    # Get the default collection name from dropdown selection or sidebar
+    default_collection = ""
+    if collections and 'collection_selector' in st.session_state:
+        default_collection = st.session_state.collection_selector
+    else:
+        default_collection = COLLECTION_NAME
+    
+    target_collection = st.text_input(
+        "Collection name for this upload:",
+        value=default_collection,
+        help="Enter a new collection name or use the selected collection from above"
+    )
+    
+    if not target_collection.strip():
+        st.warning("Please enter a collection name.")
+        st.stop()
 
     # New: detect text/tsv/csv and provide a Parse & Index action
     parse_button = st.button("Parse & Index file into Qdrant")
@@ -619,7 +709,7 @@ else:
                 render_chunk_card(c)
 
             # index and upsert
-            index_chunks_and_upsert(chunks)
+            index_chunks_and_upsert(chunks, target_collection)
 
         else:
             # TSV/CSV/TXT path
@@ -637,10 +727,32 @@ else:
                 render_chunk_card(c)
 
             # index and upsert
-            index_chunks_and_upsert(parsed_chunks)
+            index_chunks_and_upsert(parsed_chunks, target_collection)
 
+# Search section - only show if collections exist
+if collections:
     st.divider()
     st.header("Ask questions about the document")
+    
+    # Search collection selection
+    st.subheader("Search Settings")
+    
+    # Get default search collection (recently uploaded or first available)
+    default_search_collection = ""
+    if st.session_state.get("recently_uploaded_collection"):
+        default_search_collection = st.session_state.recently_uploaded_collection
+    elif collections:
+        default_search_collection = collections[0]
+    else:
+        default_search_collection = COLLECTION_NAME
+    
+    search_collection = st.selectbox(
+        "Search in collection:",
+        collections if collections else [COLLECTION_NAME],
+        index=collections.index(default_search_collection) if collections and default_search_collection in collections else 0,
+        key="search_collection_selector"
+    )
+    
     query = st.text_input("Type your question here")
     ask_button = st.button("Search & Retrieve")
 
@@ -661,13 +773,13 @@ else:
         with st.spinner("Embedding the query..."):
             q_emb = embed_model.encode([query], convert_to_numpy=True)[0].tolist()
 
-            results = search_qdrant(client, COLLECTION_NAME, q_emb, top_k=TOP_K)
+            results = search_qdrant(client, search_collection, q_emb, top_k=TOP_K)
 
         if not results:
             st.warning("No results found — maybe the PDF wasn't indexed, or collection name differs.")
         else:
             st.subheader("Search Results")
-            st.write(f"Top {min(len(results), TOP_K)} results from collection '{COLLECTION_NAME}':")
+            st.write(f"Top {min(len(results), TOP_K)} results from collection '{search_collection}':")
 
             def render_result_card(r: Dict[str, Any], idx: int):
                 """
@@ -676,6 +788,10 @@ else:
                 """
                 # Extract and clean the text
                 raw_text = r.get('text', '') or ''
+                
+                # Ensure raw_text is a string
+                if not isinstance(raw_text, str):
+                    raw_text = str(raw_text)
                 
                 # Clean HTML and normalize whitespace
                 clean_text = html.unescape(raw_text)
@@ -742,7 +858,7 @@ else:
                 render_result_card(r, i)
 
             # Combined context
-            combined = "\n\n---\n\n".join([r["text"] for r in results[:TOP_K]])
+            combined = "\n\n---\n\n".join([str(r.get("text", "")) for r in results[:TOP_K]])
             st.divider()
             st.subheader("Combined context (top results)")
             st.markdown(f"<div class='combined'>{combined[:8000].replace('<','&lt;').replace('>','&gt;')}{'...' if len(combined)>8000 else ''}</div>", unsafe_allow_html=True)
