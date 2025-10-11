@@ -5,6 +5,8 @@ import uuid
 from typing import List, Dict, Any
 import json
 import csv
+import html
+import re
 
 import streamlit as st
 
@@ -690,36 +692,44 @@ else:
             st.subheader("Search Results")
             st.write(f"Top {min(len(results), TOP_K)} results from collection '{COLLECTION_NAME}':")
 
-            def render_result_card(r, idx):
-                score_str = f"{r['score']:.4f}" if r['score'] is not None else "n/a"
-                text_preview = (r['text'] or "")[:2000]
-                # safe meta rendering
-                meta_html = ""
-                if r.get("meta"):
-                    meta_html = f"<div class='meta'>Metadata: {json.dumps(r['meta'], ensure_ascii=False)}</div>"
+            def render_result_card(r: Dict[str, Any], idx: int):
+                """
+                Render a search result using Streamlit native components.
+                Shows score, text and metadata cleanly without HTML markup.
+                """
+                # Extract and clean the text
+                raw_text = r.get('text', '') or ''
+                # Remove HTML tags and decode entities
+                clean_text = html.unescape(raw_text)
+                clean_text = re.sub(r'<[^>]+>', '', clean_text)
+                
+                # Get score and ID
+                score = r.get('score')
+                score_str = f"{score:.4f}" if score is not None else "n/a"
+                rid = r.get('id', '')
 
-                # escape to avoid raw HTML injection
-                text_esc = text_preview.replace("<", "&lt;").replace(">", "&gt;")
+                # Use Streamlit's native components for clean layout
+                st.markdown(f"#### Result #{idx+1}")
+                
+                # Score and ID in columns
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    st.markdown("**Score:**")
+                    st.markdown(f"_{score_str}_")
+                with col2:
+                    st.markdown(f"**ID:** {rid}")
+                
+                # Main text in an expander for better space management
+                with st.expander("Show Text", expanded=True):
+                    st.markdown(clean_text)
 
-                html = f'''
-                  <div class="card">
-                    <div style="display:flex;justify-content:space-between;align-items:center">
-                      <div style="font-weight:700">Result #{idx+1}</div>
-                      <div><span class="result-score">{score_str}</span><span style="color:var(--muted);font-size:13px">id: {r['id']}</span></div>
-                    </div>
-
-                    <div style="margin-top:10px">
-                      <div style="font-weight:600;margin-bottom:6px">Score:</div>
-                      <div style="color:var(--accent);margin-bottom:10px">{score_str}</div>
-
-                      <div style="font-weight:600;margin-bottom:6px">Text:</div>
-                      <div class="preview" style="margin-top:0px">{text_esc}</div>
-                    </div>
-
-                    {meta_html}
-                  </div>
-                '''
-                st.markdown(html, unsafe_allow_html=True)
+                # Show metadata if present
+                if r.get('meta'):
+                    with st.expander("Metadata"):
+                        st.json(r['meta'])
+                
+                # Add a visual separator
+                st.markdown("---")
 
             for i, r in enumerate(results[:TOP_K]):
                 render_result_card(r, i)
