@@ -532,61 +532,56 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
 
 def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: List[float], top_k: int = 4):
     """
-    Use Qdrant's query_points API with proper parameters to ensure results are returned.
+    Search vectors in Qdrant collection using semantic similarity.
+    Handles QueryResponse object correctly.
     Returns: [{"id": str, "score": float, "text": str, "meta": dict}, ...]
     """
     try:
-        results = client.search(
+        response = client.query_points(
             collection_name=collection_name,
-            query_vector=query_embedding,
-            limit=top_k
+            query=query_embedding,
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False
         )
-    except Exception as e:
-        # If search fails, try query_points with specific parameters
-        try:
-            results = client.query_points(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                with_payload=True,  # ensure we get text content
-                with_vectors=False,  # we don't need vectors back
-                limit=top_k
-            )
-        except Exception as e2:
-            raise RuntimeError(f"Qdrant search failed: {e2}") from e2
+        
+        # Handle QueryResponse object - access its points attribute
+        results = response.points if hasattr(response, 'points') else []
+        
+        # Debug info
+        st.write(f"Debug: Found {len(results)} points in response")
+        
+        out = []
+        for point in results:
+            # Extract payload and score
+            payload = point.payload if hasattr(point, 'payload') else {}
+            score = point.score if hasattr(point, 'score') else None
+            point_id = point.id if hasattr(point, 'id') else None
 
-    # Normalize results to our expected format
-    out = []
-    if not results:
+            # Get text and metadata from payload
+            text = payload.get('text', '')
+            meta = payload.get('meta', {})
+            
+            # Only add if we have text
+            if text:
+                out.append({
+                    'id': str(point_id) if point_id is not None else '',
+                    'score': float(score) if score is not None else None,
+                    'text': text,
+                    'meta': meta
+                })
+        
+        # More debug info
+        if not out:
+            st.write("Debug: No results with text found")
+            st.write("Debug: Raw response type:", type(response))
+            
         return out
-
-    for point in results:
-        # Handle both dict and object responses
-        if isinstance(point, dict):
-            point_id = point.get('id')
-            score = point.get('score')
-            payload = point.get('payload', {})
-        else:
-            point_id = getattr(point, 'id', None)
-            score = getattr(point, 'score', None)
-            payload = getattr(point, 'payload', {})
-
-        # Ensure payload is a dict
-        if not isinstance(payload, dict):
-            payload = {}
-
-        # Extract text and metadata
-        text = payload.get('text', '')
-        meta = payload.get('meta', {})
-
-        # Build normalized result
-        out.append({
-            'id': str(point_id) if point_id is not None else '',
-            'score': float(score) if score is not None else None,
-            'text': text,
-            'meta': meta
-        })
-
-    return out
+        
+    except Exception as e:
+        st.error(f"Search failed: {str(e)}")
+        st.write("Debug: Query vector shape:", len(query_embedding))
+        raise RuntimeError(f"Qdrant search failed: {e}")
 
 
 # Begin UI interaction
@@ -666,7 +661,6 @@ else:
         with st.spinner("Embedding the query..."):
             q_emb = embed_model.encode([query], convert_to_numpy=True)[0].tolist()
 
-        with st.spinner("Searching Qdrant for relevant chunks..."):
             results = search_qdrant(client, COLLECTION_NAME, q_emb, top_k=TOP_K)
 
         if not results:
