@@ -427,17 +427,24 @@ def render_chunk_card(chunk: Dict[str, Any]):
     Render a single chunk as a styled card in Streamlit.
     Safely handle meta (ensure dict), escape text, and show id / chunk index.
     """
-    # Ensure safe meta
+    # Safely get meta
     meta = chunk.get("meta") or {}
     if not isinstance(meta, dict):
         meta = {"meta": str(meta)}
 
+    # Safely get chunk index and id
     chunk_index = meta.get("chunk_index", meta.get("row_index", "-"))
     chunk_id = chunk.get("id", "-")
-    preview = (chunk.get("text", "") or "")[:1200]
+
+    # Safely get and slice text
+    text = chunk.get("text", "")
+    if not isinstance(text, str):
+        text = str(text)
+    preview = text[:1200] if text else ""
 
     # Escape HTML-sensitive chars
     preview_escaped = preview.replace("<", "&lt;").replace(">", "&gt;")
+    
     # Stringify meta for display
     try:
         meta_str = json.dumps(meta, ensure_ascii=False)
