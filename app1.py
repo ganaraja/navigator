@@ -532,75 +532,58 @@ def upsert_chunks_to_qdrant(client: QdrantClient, collection_name: str, embeddin
 
 def search_qdrant(client: QdrantClient, collection_name: str, query_embedding: List[float], top_k: int = 4):
     """
-    Run a vector search and return normalized results:
-    [{"id": str, "score": float|None, "text": str, "meta": dict}, ...]
-    Tries several qdrant-client method names and response shapes.
+    Use Qdrant's query_points API with proper parameters to ensure results are returned.
+    Returns: [{"id": str, "score": float, "text": str, "meta": dict}, ...]
     """
-    # try common client methods with different parameter names
-    res = None
-    tried = []
-    for method in ("search", "search_points", "query_points", "query", "search_collection"):
-        if not hasattr(client, method):
-            continue
-        tried.append(method)
-        fn = getattr(client, method)
+    try:
+        results = client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=top_k
+        )
+    except Exception as e:
+        # If search fails, try query_points with specific parameters
         try:
-            # different method signatures across versions
-            try:
-                res = fn(collection_name=collection_name, query_vector=query_embedding, limit=top_k)
-            except TypeError:
-                try:
-                    res = fn(collection_name=collection_name, query=query_embedding, limit=top_k)
-                except TypeError:
-                    res = fn(collection_name=collection_name, vector=query_embedding, limit=top_k)
-            break
-        except Exception:
-            # try next
-            res = None
+            results = client.query_points(
+                collection_name=collection_name,
+                query_vector=query_embedding,
+                with_payload=True,  # ensure we get text content
+                with_vectors=False,  # we don't need vectors back
+                limit=top_k
+            )
+        except Exception as e2:
+            raise RuntimeError(f"Qdrant search failed: {e2}") from e2
 
-    if res is None:
-        raise RuntimeError(f"Qdrant search failed: no compatible search method succeeded (tried: {tried})")
-
-    # Normalize items list
-    if isinstance(res, dict):
-        items = res.get("result") or res.get("points") or res.get("hits") or []
-    else:
-        items = list(res)
-
+    # Normalize results to our expected format
     out = []
-    for item in items:
-        # support object-with-attrs or dicts
-        if isinstance(item, dict):
-            payload = item.get("payload") or item.get("payload", {}) or item.get("payload", None)
-            score = item.get("score") or item.get("distance") or item.get("payload", {}).get("score") if isinstance(item.get("payload"), dict) else None
-            id_ = item.get("id") or item.get("point_id") or item.get("payload", {}).get("id")
+    if not results:
+        return out
+
+    for point in results:
+        # Handle both dict and object responses
+        if isinstance(point, dict):
+            point_id = point.get('id')
+            score = point.get('score')
+            payload = point.get('payload', {})
         else:
-            payload = getattr(item, "payload", None)
-            score = getattr(item, "score", None) or getattr(item, "distance", None)
-            id_ = getattr(item, "id", None) or getattr(item, "point_id", None)
+            point_id = getattr(point, 'id', None)
+            score = getattr(point, 'score', None)
+            payload = getattr(point, 'payload', {})
 
-        # payload -> text/meta extraction (robust)
-        text = ""
-        meta = {}
-        if isinstance(payload, dict):
-            # common patterns: payload={"text": "...", "meta": {...}} or payload={"payload": {...}}
-            if "text" in payload:
-                text = payload.get("text") or ""
-            elif "payload" in payload and isinstance(payload["payload"], dict):
-                text = payload["payload"].get("text", "") or ""
-                meta = payload["payload"].get("meta", {}) or {}
-            else:
-                # fallback: try to stringify the payload
-                text = payload.get("text") or ""
-                meta = payload.get("meta") or {}
-        elif payload is not None:
-            text = str(payload)
+        # Ensure payload is a dict
+        if not isinstance(payload, dict):
+            payload = {}
 
+        # Extract text and metadata
+        text = payload.get('text', '')
+        meta = payload.get('meta', {})
+
+        # Build normalized result
         out.append({
-            "id": str(id_) if id_ is not None else "",
-            "score": float(score) if score is not None else None,
-            "text": text or "",
-            "meta": meta or {}
+            'id': str(point_id) if point_id is not None else '',
+            'score': float(score) if score is not None else None,
+            'text': text,
+            'meta': meta
         })
 
     return out
@@ -694,22 +677,43 @@ else:
 
             def render_result_card(r: Dict[str, Any], idx: int):
                 """
-                Render a search result using Streamlit native components.
-                Shows score, text and metadata cleanly without HTML markup.
+                Render a search result using Streamlit native components with improved text formatting.
+                Shows score, text in readable paragraphs, and metadata.
                 """
                 # Extract and clean the text
                 raw_text = r.get('text', '') or ''
-                # Remove HTML tags and decode entities
+                
+                # Clean HTML and normalize whitespace
                 clean_text = html.unescape(raw_text)
                 clean_text = re.sub(r'<[^>]+>', '', clean_text)
+                
+                # Normalize line endings
+                clean_text = re.sub(r'\r\n|\r', '\n', clean_text)
+                
+                # Format paragraphs:
+                # 1. Split on multiple newlines
+                paragraphs = re.split(r'\n\s*\n', clean_text)
+                # 2. Clean each paragraph
+                paragraphs = [re.sub(r'\s+', ' ', p.strip()) for p in paragraphs if p.strip()]
+                
+                # Format vectors/lists (lines starting with numbers, bullets, etc.)
+                formatted_paragraphs = []
+                for p in paragraphs:
+                    # If paragraph contains list-like items, split them
+                    if re.search(r'^[\d\-\•\*]\s|[\n][\d\-\•\*]\s', p):
+                        items = re.split(r'(?m)^[\d\-\•\*]\s', p)
+                        items = [item.strip() for item in items if item.strip()]
+                        formatted_paragraphs.append('\n'.join(f"• {item}" for item in items))
+                    else:
+                        formatted_paragraphs.append(p)
                 
                 # Get score and ID
                 score = r.get('score')
                 score_str = f"{score:.4f}" if score is not None else "n/a"
                 rid = r.get('id', '')
 
-                # Use Streamlit's native components for clean layout
-                st.markdown(f"#### Result #{idx+1}")
+                # Render the card
+                st.markdown(f"### Result #{idx+1}")
                 
                 # Score and ID in columns
                 col1, col2 = st.columns([1, 3])
@@ -719,16 +723,25 @@ else:
                 with col2:
                     st.markdown(f"**ID:** {rid}")
                 
-                # Main text in an expander for better space management
+                # Show formatted text
                 with st.expander("Show Text", expanded=True):
-                    st.markdown(clean_text)
-
+                    # Display each paragraph with spacing
+                    for i, para in enumerate(formatted_paragraphs):
+                        if i > 0:
+                            st.markdown("---")  # visual separator between paragraphs
+                        if para.startswith('•'):
+                            # Format as a list
+                            st.markdown(para)
+                        else:
+                            # Format as a regular paragraph
+                            st.write(para)
+                
                 # Show metadata if present
                 if r.get('meta'):
-                    with st.expander("Metadata"):
+                    with st.expander("Metadata", expanded=False):
                         st.json(r['meta'])
                 
-                # Add a visual separator
+                # Visual separator between results
                 st.markdown("---")
 
             for i, r in enumerate(results[:TOP_K]):
