@@ -180,7 +180,7 @@ def inject_custom_css():
 
 inject_custom_css()
 
-st.title("📄 Document QA — Docling + Chonkie + Local Embeddings + Qdrant")
+st.title("📄 Document Navigator")
 st.caption("Upload a PDF, parse it, chunk it, embed locally, store in Qdrant, and ask questions.")
 
 # Sidebar: connection settings for Qdrant
