@@ -375,6 +375,10 @@ def index_chunks_and_upsert(chunks: List[Dict[str, Any]], collection_name: str =
     
     # Track the recently uploaded collection for search defaults
     st.session_state.recently_uploaded_collection = collection_name
+    
+    # Force refresh of collections in all dropdowns
+    st.session_state.collections_refreshed = True
+    st.rerun()
 # ...existing code...
 
 # Parse PDF using docling if available, else use pdfplumber
@@ -748,7 +752,10 @@ def delete_collection(collection_name):
         st.error(f"Error deleting collection '{collection_name}': {e}")
         return False
 
-# Get all collections
+# Get all collections (refresh if needed)
+if st.session_state.get("collections_refreshed", False):
+    # Clear any cached collections and refresh
+    st.session_state.collections_refreshed = False
 collections = get_all_collections()
 
 if collections:
